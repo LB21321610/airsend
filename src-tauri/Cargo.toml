@@ -1,0 +1,34 @@
+[package]
+name = "airsend"
+version = "0.1.0"
+description = "Local-first LAN file transfer"
+authors = ["Airsend"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2.4.1"
+tauri-plugin-fs = "2.4.4"
+tauri-plugin-opener = "2.5.0"
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["v4", "serde"] }
+if-addrs = "0.14"
+hostname = "0.4"
+blake3 = "1.5"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
