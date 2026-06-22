@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { open } from '@tauri-apps/plugin-dialog'
+import {
+  getAppSnapshot,
+  listenTransferProgress,
+  openFilePicker,
+  sendFiles,
+  setAutoAccept,
+  setSaveDirectory,
+  userFacingRuntimeError,
+} from './desktopRuntime'
 import './App.css'
 
 type Device = {
@@ -101,25 +107,35 @@ function App() {
   const [latestProgress, setLatestProgress] = useState<TransferProgressEvent | null>(null)
 
   const nearbyDevices = snapshot.devices
-  const targetDeviceId = selectedDeviceId || nearbyDevices[0]?.deviceId || ''
+  const onlineDevices = nearbyDevices.filter((device) => device.online)
+  const targetDeviceId = selectedDeviceId
+  const targetDevice = nearbyDevices.find((device) => device.deviceId === targetDeviceId)
   const safeInterfaces = snapshot.interfaces.filter((iface) => iface.allowedForBind)
+  const blockedInterfaces = snapshot.interfaces.length - safeInterfaces.length
   const queuedBytes = useMemo(
     () => snapshot.transferHistory.reduce((total, item) => total + item.totalBytes, 0),
     [snapshot.transferHistory],
   )
+  const canSend = selectedPaths.length > 0 && Boolean(targetDevice?.online)
+  const selectionSummary =
+    selectedPaths.length > 0 ? compactPathList(selectedPaths) : 'No files selected'
 
   const refreshSnapshot = useCallback(async () => {
     try {
       setError(null)
-      const next = await invoke<AppSnapshot>('get_app_snapshot')
+      const next = await getAppSnapshot<AppSnapshot>()
       setSnapshot(next)
-      if (!selectedDeviceId && next.devices.length > 0) {
-        setSelectedDeviceId(next.devices[0].deviceId)
-      }
+      setSelectedDeviceId((currentDeviceId) => {
+        const selectedDeviceStillOnline = next.devices.some(
+          (device) => device.deviceId === currentDeviceId && device.online,
+        )
+        if (selectedDeviceStillOnline) return currentDeviceId
+        return next.devices.find((device) => device.online)?.deviceId ?? ''
+      })
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      setError(userFacingRuntimeError(err))
     }
-  }, [selectedDeviceId])
+  }, [])
 
   useEffect(() => {
     void refreshSnapshot()
@@ -127,10 +143,12 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined
-    void listen<TransferProgressEvent>('transfer-progress', (event) => {
-      setLatestProgress(event.payload)
+    void listenTransferProgress<TransferProgressEvent>((payload) => {
+      setLatestProgress(payload)
     }).then((cleanup) => {
       unlisten = cleanup
+    }).catch((err) => {
+      setError(userFacingRuntimeError(err))
     })
 
     return () => {
@@ -139,28 +157,46 @@ function App() {
   }, [])
 
   async function chooseFiles() {
-    const result = await open({ multiple: true, directory: false })
-    setSelectedPaths(normalizeDialogResult(result))
+    try {
+      const result = await openFilePicker({ multiple: true, directory: false })
+      setSelectedPaths(normalizeDialogResult(result))
+      setError(null)
+    } catch (err) {
+      setError(userFacingRuntimeError(err))
+    }
   }
 
   async function chooseFolder() {
-    const result = await open({ multiple: false, directory: true })
-    setSelectedPaths(normalizeDialogResult(result))
+    try {
+      const result = await openFilePicker({ multiple: false, directory: true })
+      setSelectedPaths(normalizeDialogResult(result))
+      setError(null)
+    } catch (err) {
+      setError(userFacingRuntimeError(err))
+    }
   }
 
   async function chooseSaveDirectory() {
-    const result = await open({ multiple: false, directory: true })
-    const [saveDirectory] = normalizeDialogResult(result)
-    if (!saveDirectory) return
-    const next = await invoke<AppSnapshot>('set_save_directory', { saveDirectory })
-    setSnapshot(next)
+    try {
+      const result = await openFilePicker({ multiple: false, directory: true })
+      const [saveDirectory] = normalizeDialogResult(result)
+      if (!saveDirectory) return
+      const next = await setSaveDirectory<AppSnapshot>(saveDirectory)
+      setSnapshot(next)
+      setError(null)
+    } catch (err) {
+      setError(userFacingRuntimeError(err))
+    }
   }
 
   async function toggleAutoAccept() {
-    const next = await invoke<AppSnapshot>('set_auto_accept', {
-      autoAccept: !snapshot.settings.autoAccept,
-    })
-    setSnapshot(next)
+    try {
+      const next = await setAutoAccept<AppSnapshot>(!snapshot.settings.autoAccept)
+      setSnapshot(next)
+      setError(null)
+    } catch (err) {
+      setError(userFacingRuntimeError(err))
+    }
   }
 
   async function queueTransfer() {
@@ -168,30 +204,33 @@ function App() {
       setError('Choose at least one file or folder first.')
       return
     }
-    if (!targetDeviceId) {
-      setError('No nearby peer is available yet. Start Airsend on another device first.')
+    if (!targetDevice?.online) {
+      setError('Choose an available nearby device first.')
       return
     }
 
-    const next = await invoke<AppSnapshot>('send_files', {
-      request: {
-        targetDeviceId,
+    try {
+      const next = await sendFiles<AppSnapshot>({
+        targetDeviceId: targetDevice.deviceId,
         paths: selectedPaths,
-      },
-    })
-    setSnapshot(next)
-    setLatestProgress({
-      transferId: next.transferHistory[0]?.transferId ?? 'queued',
-      status: 'Queued for local transfer engine',
-      transferredBytes: 0,
-      totalBytes: next.transferHistory[0]?.totalBytes ?? 0,
-      bytesPerSecond: 0,
-    })
+      })
+      setSnapshot(next)
+      setLatestProgress({
+        transferId: next.transferHistory[0]?.transferId ?? 'queued',
+        status: 'Queued for local transfer engine',
+        transferredBytes: 0,
+        totalBytes: next.transferHistory[0]?.totalBytes ?? 0,
+        bytesPerSecond: 0,
+      })
+      setError(null)
+    } catch (err) {
+      setError(userFacingRuntimeError(err))
+    }
   }
 
   return (
     <main
-      className={isDragging ? 'app-shell dragging' : 'app-shell'}
+      className={isDragging ? 'app-shell is-dragging' : 'app-shell'}
       onDragOver={(event) => {
         event.preventDefault()
         setIsDragging(true)
@@ -200,69 +239,50 @@ function App() {
       onDrop={(event) => {
         event.preventDefault()
         setIsDragging(false)
+        setError('Use Choose files or Choose folder so Airsend can receive exact local paths.')
       }}
     >
-      <section className="hero-band">
-        <div>
-          <p className="eyebrow">Local P2P transfer</p>
-          <h1>Airsend</h1>
-          <p className="hero-copy">
-            Fast LAN file transfer with local-only discovery, private interface guards, and a
-            resumable transfer core taking shape underneath.
-          </p>
+      <header className="app-header">
+        <div className="brand-lockup" aria-label="Airsend local device">
+          <div className="app-mark">A</div>
+          <div>
+            <h1>Airsend</h1>
+            <p>{snapshot.localDevice.displayName}</p>
+          </div>
         </div>
-        <div className="device-orbit" aria-label="Local device">
-          <span className="pulse-ring"></span>
-          <div className="device-avatar">{initials(snapshot.localDevice.displayName)}</div>
-          <strong>{snapshot.localDevice.displayName}</strong>
-          <small>{safeInterfaces.length} safe LAN interface{safeInterfaces.length === 1 ? '' : 's'}</small>
+        <div className="status-strip" aria-label="Local network status">
+          <span className="status-pill good">{safeInterfaces.length} LAN ready</span>
+          <span className={blockedInterfaces > 0 ? 'status-pill warn' : 'status-pill'}>
+            {blockedInterfaces} blocked
+          </span>
+          <button className="ghost-button" onClick={refreshSnapshot}>
+            Refresh
+          </button>
+        </div>
+      </header>
+
+      <section className="alerts" aria-live="polite">
+        {error && (
+          <div className="notice error" role="alert">
+            <strong>Action needed</strong>
+            <span>{error}</span>
+          </div>
+        )}
+        <div className="notice">
+          <strong>{snapshot.firewallGuidance.title}</strong>
+          <span>{snapshot.firewallGuidance.platformHint}</span>
         </div>
       </section>
 
-      {error && <div className="notice error">{error}</div>}
-      <div className="notice">
-        <strong>{snapshot.firewallGuidance.title}</strong>
-        <span>{snapshot.firewallGuidance.platformHint}</span>
-      </div>
-
-      <section className="workspace">
-        <aside className="panel">
-          <div className="panel-heading">
-            <p className="eyebrow">Nearby</p>
-            <button onClick={refreshSnapshot}>Refresh</button>
-          </div>
-          <div className="device-list">
-            {nearbyDevices.length === 0 ? (
-              <div className="empty-state">
-                <div className="mini-orbit">{initials(snapshot.localDevice.displayName)}</div>
-                <strong>No peers yet</strong>
-                <span>Discovery hooks are ready; mDNS runtime lands next.</span>
-              </div>
-            ) : (
-              nearbyDevices.map((device) => (
-                <button
-                  className={device.deviceId === targetDeviceId ? 'device-row active' : 'device-row'}
-                  key={device.deviceId}
-                  onClick={() => setSelectedDeviceId(device.deviceId)}
-                >
-                  <span>{initials(device.displayName)}</span>
-                  <div>
-                    <strong>{device.displayName}</strong>
-                    <small>{device.trusted ? 'Trusted' : 'Pairing required'}</small>
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
-        </aside>
-
-        <section className="drop-panel">
-          <div className="drop-zone">
-            <div className="drop-icon">Up</div>
-            <h2>Drop files here</h2>
+      <section className="workspace" aria-label="File transfer workspace">
+        <section className="send-panel">
+          <div className="drop-zone" aria-label="Select files or folders to send">
+            <div className="drop-icon" aria-hidden="true">
+              ↑
+            </div>
+            <h2>{isDragging ? 'Release to continue with the picker' : 'Send files on this network'}</h2>
             <p>
-              Desktop drag/drop animation is in place. Use the picker for real local paths while
-              Tauri file-drop handling is wired in.
+              Choose files or a folder, select a nearby device, then queue the transfer locally.
             </p>
             <div className="actions">
               <button onClick={chooseFiles}>Choose files</button>
@@ -273,10 +293,10 @@ function App() {
           <div className="selection-bar">
             <div>
               <span>{selectedPaths.length} selected</span>
-              <strong>{selectedPaths.length > 0 ? compactPathList(selectedPaths) : 'Ready when you are'}</strong>
+              <strong title={selectionSummary}>{selectionSummary}</strong>
             </div>
-            <button className="primary" onClick={queueTransfer}>
-              Queue transfer
+            <button className="primary" onClick={queueTransfer} disabled={!canSend}>
+              {targetDevice ? `Send to ${targetDevice.displayName}` : 'Choose a device'}
             </button>
           </div>
 
@@ -284,7 +304,13 @@ function App() {
             <div className="progress-card">
               <div>
                 <strong>{latestProgress.status}</strong>
-                <span>{formatBytes(latestProgress.totalBytes)} prepared</span>
+                <span>
+                  {formatBytes(latestProgress.transferredBytes)} of{' '}
+                  {formatBytes(latestProgress.totalBytes)}
+                  {latestProgress.bytesPerSecond > 0
+                    ? ` · ${formatBytes(latestProgress.bytesPerSecond)}/s`
+                    : ''}
+                </span>
               </div>
               <div className="progress-track">
                 <span style={{ width: `${progressPercent(latestProgress)}%` }}></span>
@@ -293,11 +319,63 @@ function App() {
           )}
         </section>
 
-        <aside className="panel">
-          <p className="eyebrow">Settings</p>
+        <aside className="panel device-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Nearby devices</p>
+              <h2>
+                {nearbyDevices.length === 0
+                  ? 'Looking on this network'
+                  : `${onlineDevices.length} available`}
+              </h2>
+            </div>
+            <span className="live-dot" aria-label="Discovery active"></span>
+          </div>
+          <div className="device-list" aria-live="polite">
+            {nearbyDevices.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon" aria-hidden="true">
+                  {initials(snapshot.localDevice.displayName)}
+                </div>
+                <strong>No nearby devices</strong>
+                <span>Keep Airsend open on another device connected to the same Wi-Fi.</span>
+              </div>
+            ) : (
+              nearbyDevices.map((device) => (
+                <button
+                  className={device.deviceId === targetDeviceId ? 'device-row active' : 'device-row'}
+                  aria-pressed={device.deviceId === targetDeviceId}
+                  disabled={!device.online}
+                  key={device.deviceId}
+                  onClick={() => setSelectedDeviceId(device.deviceId)}
+                >
+                  <span className="device-initials">{initials(device.displayName)}</span>
+                  <div>
+                    <strong>{device.displayName}</strong>
+                    <small>
+                      {device.trusted ? 'Trusted' : 'Pairing required'} ·{' '}
+                      {device.online ? 'Online' : 'Offline'}
+                    </small>
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
+        </aside>
+
+        <aside className="panel settings-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Receiving</p>
+              <h2>Rules and location</h2>
+            </div>
+          </div>
           <div className="settings-list">
             <label>
-              <span>Auto accept trusted peers</span>
+              <span>
+                <strong>Auto accept trusted peers</strong>
+                <small>Skip confirmation only for paired devices.</small>
+              </span>
               <input
                 type="checkbox"
                 checked={snapshot.settings.autoAccept}
@@ -307,11 +385,13 @@ function App() {
             <div>
               <span>Save directory</span>
               <strong>{snapshot.settings.saveDirectory ?? 'Ask every time'}</strong>
-              <button onClick={chooseSaveDirectory}>Change</button>
+              <button className="secondary" onClick={chooseSaveDirectory}>
+                Change
+              </button>
             </div>
             <div>
-              <span>Workers</span>
-              <strong>{snapshot.settings.parallelWorkers}</strong>
+              <span>Transfer workers</span>
+              <strong>{snapshot.settings.parallelWorkers} parallel connections</strong>
             </div>
           </div>
         </aside>
@@ -320,20 +400,26 @@ function App() {
       <section className="lower-grid">
         <div className="panel">
           <div className="panel-heading">
-            <p className="eyebrow">Transfer history</p>
-            <span>{formatBytes(queuedBytes)} total</span>
+            <div>
+              <p className="eyebrow">Transfer queue</p>
+              <h2>Recent activity</h2>
+            </div>
+            <span className="panel-total">{formatBytes(queuedBytes)} total</span>
           </div>
           <div className="history-list">
             {snapshot.transferHistory.length === 0 ? (
-              <p className="muted">No transfers yet.</p>
+              <div className="empty-row">
+                <strong>No transfers yet</strong>
+                <span>Queued sends and received files will appear here.</span>
+              </div>
             ) : (
               snapshot.transferHistory.map((item) => (
                 <div className="history-row" key={item.transferId}>
                   <div>
                     <strong>{item.fileCount} item{item.fileCount === 1 ? '' : 's'}</strong>
-                    <span>{item.direction} - {item.status}</span>
+                    <span>{item.direction} · {statusLabel(item.status)}</span>
                   </div>
-                  <span>{formatBytes(item.totalBytes)}</span>
+                  <span className={`status-text ${item.status}`}>{formatBytes(item.totalBytes)}</span>
                 </div>
               ))
             )}
@@ -341,10 +427,18 @@ function App() {
         </div>
 
         <div className="panel">
-          <p className="eyebrow">LAN guard</p>
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">LAN guard</p>
+              <h2>Bind targets</h2>
+            </div>
+          </div>
           <div className="interface-list">
             {snapshot.interfaces.length === 0 ? (
-              <p className="muted">No interfaces reported yet.</p>
+              <div className="empty-row">
+                <strong>No interfaces reported</strong>
+                <span>Airsend will only listen on private local addresses.</span>
+              </div>
             ) : (
               snapshot.interfaces.map((iface) => (
                 <div className="interface-row" key={`${iface.name}-${iface.ip}`}>
@@ -363,6 +457,18 @@ function App() {
       </section>
     </main>
   )
+}
+
+function statusLabel(status: TransferHistoryRecord['status']) {
+  const labels: Record<TransferHistoryRecord['status'], string> = {
+    queued: 'Queued',
+    waitingForApproval: 'Waiting for approval',
+    transferring: 'Transferring',
+    completed: 'Completed',
+    failed: 'Failed',
+    cancelled: 'Cancelled',
+  }
+  return labels[status]
 }
 
 function normalizeDialogResult(result: string | string[] | null): string[] {
